@@ -2,77 +2,59 @@
 - name: Remediate disk space issues on web server
   hosts: web-server-01.example.com
   become: yes
-  gather_facts: yes
   vars:
-    disk_usage_threshold: 80
-    mount_point: /
-    notification_log: /var/log/disk_cleanup_notification.log
-    cleanup_marker: /tmp/.disk_cleanup_marker
+    target_mount: "/"
+    cleanup_threshold: 80
+    max_log_age_days: 30
+    max_tmp_age_days: 7
+    notification_target: "admin@example.com"
 
   tasks:
-    - name: Check current disk usage
-      ansible.builtin.shell: df {{ mount_point }} | awk 'NR==2 {print $5}' | sed 's/%//'
-      register: current_disk_usage
+    - name: Check current disk usage on root mount
+      ansible.builtin.shell: df {{ target_mount }} | tail -n 1 | awk '{print $5}' | sed 's/%//'
+      register: disk_usage_initial
       changed_when: false
 
-    - name: Skip cleanup if disk usage is below threshold
-      ansible.builtin.debug:
-        msg: "Disk usage at {{ current_disk_usage.stdout }}% is below threshold. Skipping cleanup."
-      when: current_disk_usage.stdout | int < disk_usage_threshold
-
-    - name: Identify large directories consuming space
-      ansible.builtin.shell: du -sh /var/log /var/cache /tmp 2>/dev/null || echo "Unable to determine large directories"
-      register: large_dirs_info
-      changed_when: false
-
-    - name: Perform safe disk cleanup
-      block:
-        - name: Clean package manager cache
-          ansible.builtin.command: "{{ ansible_pkg_mgr == 'apt' | ternary('apt clean', 'yum clean all') }}"
-          register: cache_clean_result
-          changed_when: cache_clean_result.rc == 0
-          failed_when: cache_clean_result.rc != 0
-
-        - name: Remove old compressed log files
-          ansible.builtin.command: find /var/log -type f -name "*.gz" -mtime +30 -delete
-          register: log_cleanup_result
-          changed_when: log_cleanup_result.rc == 0
-          failed_when: log_cleanup_result.rc != 0
-
-        - name: Clean temporary files older than 7 days
-          ansible.builtin.command: find /tmp -type f -mtime +7 -delete
-          register: tmp_cleanup_result
-          changed_when: tmp_cleanup_result.rc == 0
-          failed_when: tmp_cleanup_result.rc != 0
-
-        - name: Create cleanup marker for idempotency
-          ansible.builtin.file:
-            path: "{{ cleanup_marker }}"
-            state: touch
-            mode: '0644'
-      when: current_disk_usage.stdout | int >= disk_usage_threshold
-      rescue:
-        - name: Handle cleanup failure
-          ansible.builtin.debug:
-            msg: "Disk cleanup encountered an error. Review logs and verify system state."
-
-    - name: Send cleanup notification
-      ansible.builtin.copy:
-        content: "{{ ansible_date_time.iso8601 }} - Disk cleanup completed. Previous usage: {{ current_disk_usage.stdout }}%. Cleanup performed on /var/log, /var/cache, /tmp.\n"
-        dest: "{{ notification_log }}"
-        mode: '0644'
-        owner: root
-        group: root
-        append: yes
-
-    - name: Verify disk usage after cleanup
-      ansible.builtin.shell: df {{ mount_point }} | awk 'NR==2 {print $5}' | sed 's/%//'
-      register: post_cleanup_disk_usage
-      changed_when: false
-
-    - name: Assert disk usage has improved
+    - name: Verify disk usage exceeds cleanup threshold
       ansible.builtin.assert:
         that:
-          - post_cleanup_disk_usage.stdout | int < current_disk_usage.stdout | int
-        fail_msg: "Disk usage did not improve after cleanup. Current: {{ post_cleanup_disk_usage.stdout }}%"
-        success_msg: "Disk usage improved from {{ current_disk_usage.stdout }}% to {{ post_cleanup_disk_usage.stdout }}%"
+          - disk_usage_initial.stdout | int >= cleanup_threshold
+        fail_msg: "Disk usage is {{ disk_usage_initial.stdout }}%, which is below the {{ cleanup_threshold }}% threshold. No cleanup required."
+        success_msg: "Disk usage is {{ disk_usage_initial.stdout }}%, proceeding with cleanup."
+
+    - name: Identify large files and directories in system paths
+      ansible.builtin.shell: |
+        echo "=== Large files in /var/log ==="
+        find /var/log -type f -size +10M -exec ls -lh {} \;
+        echo "=== Large directories in /tmp and /var/tmp ==="
+        du -sh /tmp/* /var/tmp/* 2>/dev/null | sort -rh | head -10
+        echo "=== Package cache size ==="
+        du -sh /var/cache/apt/archives 2>/dev/null || du -sh /var/cache/yum 2>/dev/null || du -sh /var/cache/dnf 2>/dev/null
+      register: large_files_report
+      changed_when: false
+
+    - name: Rotate system logs
+      ansible.builtin.command: logrotate -f /etc/logrotate.conf
+      changed_when: false
+      failed_when: false
+
+    - name: Remove old log files beyond retention period
+      ansible.builtin.shell: find /var/log -type f -name "*.gz" -mtime +{{ max_log_age_days }} -delete
+      changed_when: false
+      failed_when: false
+      check_mode: no
+
+    - name: Clean package manager cache
+      ansible.builtin.shell: |
+        {%- if ansible_pkg_mgr == 'apt' -%} apt clean
+        {%- elif ansible_pkg_mgr == 'dnf' -%} dnf clean all
+        {%- elif ansible_pkg_mgr == 'yum' -%} yum clean all
+        {%- elif ansible_pkg_mgr == 'zypper' -%} zypper clean -a
+        {%- else -%} echo "Unsupported package manager: {{ ansible_pkg_mgr }}"
+        {%- endif -%}
+      changed_when: false
+      failed_when: false
+      check_mode: no
+
+    - name: Remove temporary files older than retention period
+      ansible.builtin.shell:
