@@ -1,81 +1,74 @@
 ---
-- name: Remediate disk space issues on web servers
+- name: Remediate disk space issues on web server
   hosts: web-server-01.example.com
   become: yes
+  gather_facts: yes
   vars:
     disk_threshold: 80
+    max_log_size_mb: 100
+    temp_file_age_days: 30
     safe_cleanup_paths:
       - /var/log
       - /tmp
       - /var/cache
-    max_age_days: 30
-    notification_recipient: admin@example.com
 
   tasks:
     - name: Check current disk usage for root partition
-      ansible.builtin.shell: df -P / | awk 'NR==2 {gsub(/%/, "", $5); print $5}'
+      ansible.builtin.shell: df -h / | awk 'NR==2 {print $5}' | sed 's/%//'
       register: initial_disk_usage
       changed_when: false
-      check_mode: false
+      check_mode: no
 
-    - name: Skip cleanup if disk usage is below threshold
-      ansible.builtin.debug:
-        msg: "Disk usage is {{ initial_disk_usage.stdout }}%. Cleanup skipped as it is below {{ disk_threshold }}% threshold."
-      changed_when: false
-      when: initial_disk_usage.stdout | int < disk_threshold
-
-    - name: Perform disk cleanup
-      block:
-        - name: Identify large directories and file counts
-          ansible.builtin.shell: |
-            echo "=== Large Directories ==="
-            du -sh {{ item }} 2>/dev/null || echo "0 {{ item }}"
-            echo "=== Old Files Count ==="
-            find {{ item }} -type f \( -name "*.gz" -o -name "*.old" -o -name "*.tmp" \) -mtime +{{ max_age_days }} | wc -l
-          loop: "{{ safe_cleanup_paths }}"
-          register: cleanup_report
-          changed_when: false
-
-        - name: Clean package manager cache
-          ansible.builtin.shell: |
-            if command -v apt-get &> /dev/null; then
-              apt-get clean -y
-            elif command -v yum &> /dev/null; then
-              yum clean all -y
-            elif command -v dnf &> /dev/null; then
-              dnf clean all -y
-            fi
-          changed_when: false
-
-        - name: Rotate system logs
-          ansible.builtin.command: logrotate -f /etc/logrotate.conf
-          changed_when: false
-          failed_when: false
-
-        - name: Remove old compressed logs and temporary files
-          ansible.builtin.shell: |
-            for dir in {{ safe_cleanup_paths | join(' ') }}; do
-              find "$dir" -type f -mtime +{{ max_age_days }} \( -name "*.gz" -o -name "*.old" -o -name "*.tmp" \) -delete 2>/dev/null
-            done
-          changed_when: false
+    - name: Verify disk usage exceeds threshold before cleanup
+      ansible.builtin.assert:
+        that:
+          - initial_disk_usage.stdout | int >= disk_threshold
+        fail_msg: "Disk usage is {{ initial_disk_usage.stdout }}%, which is below the {{ disk_threshold }}% threshold. Aborting cleanup to prevent unnecessary changes."
+        success_msg: "Disk usage is {{ initial_disk_usage.stdout }}%, proceeding with safe cleanup procedures."
       when: initial_disk_usage.stdout | int >= disk_threshold
-      rescue:
-        - name: Handle cleanup failure
-          ansible.builtin.debug:
-            msg: "Disk cleanup encountered an error. Please check system logs and perform manual cleanup if necessary."
+
+    - name: Identify large files and directories in safe paths
+      ansible.builtin.shell: |
+        echo "=== Large files (>{{ max_log_size_mb }}M) ==="
+        find {{ safe_cleanup_paths | join(' ') }} -type f -size +{{ max_log_size_mb }}M 2>/dev/null
+        echo "=== Large directories (>500M) ==="
+        du -h --max-depth=1 {{ safe_cleanup_paths | join(' ') }} 2>/dev/null | sort -hr
+      register: large_files_report
+      changed_when: false
+      when: initial_disk_usage.stdout | int >= disk_threshold
+
+    - name: Clean package manager cache
+      ansible.builtin.shell: |
+        if command -v apt-get &> /dev/null; then
+          apt-get clean
+        elif command -v yum &> /dev/null; then
+          yum clean all
+        elif command -v dnf &> /dev/null; then
+          dnf clean all
+        fi
+      changed_when: false
+      when: initial_disk_usage.stdout | int >= disk_threshold
+
+    - name: Truncate oversized log files safely
+      ansible.builtin.shell: |
+        find {{ safe_cleanup_paths | join(' ') }} -type f -name "*.log" -size +{{ max_log_size_mb }}M -exec truncate -s 0 {} + 2>/dev/null || true
+      changed_when: false
+      when: initial_disk_usage.stdout | int >= disk_threshold
+
+    - name: Remove temporary files older than threshold
+      ansible.builtin.shell: |
+        find /tmp /var/tmp -type f -mtime +{{ temp_file_age_days }} -delete 2>/dev/null || true
+      changed_when: true
+      when: initial_disk_usage.stdout | int >= disk_threshold
+
+    - name: Verify disk usage after cleanup
+      ansible.builtin.shell: df -h / | awk 'NR==2 {print $5}' | sed 's/%//'
+      register: final_disk_usage
+      changed_when: false
+      check_mode: no
+      when: initial_disk_usage.stdout | int >= disk_threshold
 
     - name: Send cleanup notification
       ansible.builtin.debug:
-        msg: "Disk cleanup completed on {{ inventory_hostname }}. Initial usage: {{ initial_disk_usage.stdout }}%. Notification sent to {{ notification_recipient }}."
-      changed_when: false
-
-    - name: Verify disk usage after cleanup
-      ansible.builtin.shell: df -P / | awk 'NR==2 {gsub(/%/, "", $5); print $5}'
-      register: final_disk_usage
-      changed_when: false
-      check_mode: false
-
-    - name: Report final disk usage status
-      ansible.builtin.debug:
-        msg: "Disk usage improved from {{ initial_disk_usage.stdout }}% to {{ final_disk_usage.stdout }}%."
-      changed_when: false
+        msg: "Disk cleanup completed on {{ inventory_hostname }}. Initial usage: {{ initial_disk_usage.stdout }}%, Final usage: {{ final_disk_usage.stdout | default('N/A') }}%. Review logs for details."
+      when: initial_disk_usage.stdout | int >= disk_threshold
