@@ -3,74 +3,117 @@
   hosts: web-server-01.example.com
   become: yes
   vars:
-    disk_threshold: 80
-    notification_script: /usr/local/bin/notify-disk-cleanup.sh
-    safe_paths:
-      - /var/log
-      - /tmp
-      - /var/tmp
-      - /var/cache
+    cleanup_threshold: 80
+    log_vacuum_time: 3d
+    log_vacuum_size: 500M
+    tmp_file_age: 7
+    notification_log_path: /var/log/disk_cleanup_notification.log
 
   tasks:
     - name: Check current disk usage on root partition
-      ansible.builtin.shell: df / | tail -n 1 | awk '{print $5}' | sed 's/%//'
-      register: initial_disk_usage
+      ansible.builtin.shell: df -h / | tail -n 1 | awk '{print $5}' | sed 's/%//'
+      register: disk_usage_raw
       changed_when: false
       check_mode: false
+
+    - name: Parse disk usage percentage
+      ansible.builtin.set_fact:
+        current_disk_usage: "{{ disk_usage_raw.stdout | int }}"
 
     - name: Verify disk usage meets cleanup threshold
       ansible.builtin.assert:
         that:
-          - initial_disk_usage.stdout | int >= disk_threshold
-        fail_msg: "Disk usage is {{ initial_disk_usage.stdout }}%. Cleanup threshold is {{ disk_threshold }}%. Skipping remediation."
-        success_msg: "Disk usage is {{ initial_disk_usage.stdout }}%. Proceeding with cleanup."
+          - current_disk_usage >= cleanup_threshold
+        fail_msg: "Disk usage is {{ current_disk_usage }}%, below threshold {{ cleanup_threshold }}%. Aborting to prevent unnecessary operations."
+        quiet: true
 
-    - name: Identify large files in safe directories
+    - name: Identify large files and directories for audit
       ansible.builtin.shell: |
-        find {{ safe_paths | join(' ') }} -type f -size +100M -exec du -sh {} + 2>/dev/null || true
-      register: large_files_report
+        echo "=== Large Directories (>100M) ==="
+        du -h --max-depth=2 /var/log /tmp /var/cache 2>/dev/null | sort -rh | head -20
+        echo "=== Large Files (>50M) ==="
+        find /var/log /tmp /var/cache -type f -size +50M -exec ls -lh {} \; 2>/dev/null | head -20
+      register: large_items_audit
       changed_when: false
       check_mode: false
+
+    - name: Log identified large items
+      ansible.builtin.debug:
+        msg: "{{ large_items_audit.stdout }}"
 
     - name: Perform safe disk cleanup
       block:
         - name: Clean package manager cache
-          ansible.builtin.command: "{{ pkg_cache_clean_command }}"
-          changed_when: true
-          vars:
-            pkg_cache_clean_command: >-
-              {%- if ansible_pkg_mgr == 'apt' -%}apt-get clean{%- elif ansible_pkg_mgr == 'yum' -%}yum clean all{%- elif ansible_pkg_mgr == 'dnf' -%}dnf clean all{%- endif -%}
-
-        - name: Force rotate system logs
-          ansible.builtin.command: logrotate -f /etc/logrotate.conf
-          changed_when: true
-
-        - name: Remove old rotated logs and temporary files
           ansible.builtin.shell: |
-            find /var/log -type f \( -name "*.gz" -o -name "*.old" -o -name "*.1" \) -mtime +7 -delete 2>/dev/null || true
-            find /tmp /var/tmp -type f -mtime +7 -delete 2>/dev/null || true
-          changed_when: true
+            case "{{ ansible_pkg_mgr }}" in
+              apt) apt-get clean ;;
+              dnf) dnf clean all ;;
+              yum) yum clean all ;;
+              zypper) zypper clean --all ;;
+            esac
+          register: pkg_cache_result
+          changed_when: pkg_cache_result.rc == 0
+          failed_when: pkg_cache_result.rc != 0
+          when: ansible_pkg_mgr is defined
 
+        - name: Rotate and vacuum system logs safely
+          ansible.builtin.shell: |
+            journalctl --vacuum-time={{ log_vacuum_time }} --vacuum-size={{ log_vacuum_size }} 2>/dev/null || true
+            find /var/log -type f -name "*.gz" -mtime +30 -delete 2>/dev/null || true
+            find /var/log -type f -name "*.log" -empty -delete 2>/dev/null || true
+          register: log_cleanup_result
+          changed_when: log_cleanup_result.rc == 0
+          failed_when: log_cleanup_result.rc != 0
+
+        - name: Identify old temporary files safely
+          ansible.builtin.find:
+            paths:
+              - /tmp
+              - /var/tmp
+            age: "{{ tmp_file_age }}"
+            age_unit: days
+            state: file
+            recurse: yes
+          register: old_tmp_files
+          changed_when: false
+
+        - name: Delete identified old temporary files
+          ansible.builtin.file:
+            path: "{{ item.path }}"
+            state: absent
+          loop: "{{ old_tmp_files.files }}"
+          when: old_tmp_files.files | length > 0
       rescue:
-        - name: Handle cleanup failure
+        - name: Handle cleanup failure gracefully
           ansible.builtin.debug:
-            msg: "Disk cleanup encountered an error. Review system logs for details."
+            msg: "Cleanup task failed. Review logs for details. Proceeding to verification."
 
-    - name: Verify disk usage after cleanup
-      ansible.builtin.shell: df / | tail -n 1 | awk '{print $5}' | sed 's/%//'
-      register: final_disk_usage
+    - name: Recheck disk usage after cleanup
+      ansible.builtin.shell: df -h / | tail -n 1 | awk '{print $5}' | sed 's/%//'
+      register: disk_usage_after
       changed_when: false
       check_mode: false
 
-    - name: Assert disk usage has improved
+    - name: Verify disk usage improvement
       ansible.builtin.assert:
         that:
-          - final_disk_usage.stdout | int < initial_disk_usage.stdout | int
-          - final_disk_usage.stdout | int < disk_threshold
-        fail_msg: "Disk usage did not improve sufficiently. Current: {{ final_disk_usage.stdout }}%, Previous: {{ initial_disk_usage.stdout }}%"
+          - disk_usage_after.stdout | int < current_disk_usage
+        fail_msg: "Disk usage did not improve. Current: {{ disk_usage_after.stdout }}%, Previous: {{ current_disk_usage }}%. Manual intervention may be required."
+        quiet: true
 
-    - name: Send cleanup notification
-      ansible.builtin.command: "{{ notification_script }}"
-      args:
-        creates: /tmp/.disk_cleanup_notified
-      changed_when: false
+    - name: Generate cleanup report
+      ansible.builtin.set_fact:
+        cleanup_report: |
+          Disk cleanup completed on {{ inventory_hostname }}.
+          Previous usage: {{ current_disk_usage }}%
+          Current usage: {{ disk_usage_after.stdout }}%
+          Threshold: {{ cleanup_threshold }}%
+
+    - name: Send notification via audit log
+      ansible.builtin.copy:
+        content: "{{ cleanup_report }}"
+        dest: "{{ notification_log_path }}"
+        owner: root
+        group: root
+        mode: '0644'
+        backup: yes
