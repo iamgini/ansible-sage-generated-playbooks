@@ -1,1 +1,1 @@
-# ansible-sage-generated-playbooks
+# ansible-ai-generated-playbooks
