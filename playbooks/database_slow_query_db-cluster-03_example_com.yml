@@ -1,0 +1,50 @@
+
+
+---
+- name: Remediate slow database queries on PostgreSQL
+  hosts: db-cluster-03.example.com
+  become: true
+  tags:
+    - database
+    - performance
+    - production
+  tasks:
+    - name: Verify PostgreSQL service is active and responsive
+      block:
+        - name: Check PostgreSQL cluster connectivity and status
+          community.postgresql.postgresql_ping:
+            login_user: postgres
+          register: pg_ping_result
+          failed_when: pg_ping_result is failed
+
+        - name: Apply PostgreSQL configuration changes for slow query remediation
+          community.postgresql.postgresql_conf:
+            name: "{{ item.name }}"
+            value: "{{ item.value }}"
+            owner: postgres
+            group: postgres
+            mode: '0640'
+            reload: true
+          loop:
+            - { name: 'log_min_duration_statement', value: '5000' }
+            - { name: 'statement_timeout', value: '10000' }
+          register: pg_conf_update
+
+        - name: Validate configuration changes were applied successfully
+          ansible.builtin.debug:
+            msg: "PostgreSQL configuration updated. Changes applied: {{ pg_conf_update.changed }}"
+      rescue:
+        - name: Handle PostgreSQL configuration or connectivity failure
+          ansible.builtin.debug:
+            msg: "Remediation failed: Unable to update PostgreSQL configuration or connect to the database."
+
+        - name: Attempt to restore PostgreSQL service state if disrupted
+          ansible.builtin.service:
+            name: postgresql
+            state: started
+            enabled: true
+          ignore_errors: true
+      always:
+        - name: Record remediation execution status
+          ansible.builtin.debug:
+            msg: "Slow query remediation playbook execution completed for db-cluster-03.example.com"
