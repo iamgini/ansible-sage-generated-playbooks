@@ -1,0 +1,61 @@
+
+
+---
+- name: Remediate slow database queries on PostgreSQL
+  hosts: db-cluster-03.example.com
+  become: true
+  tags:
+    - database
+    - performance
+    - production
+  tasks:
+    - name: Configure PostgreSQL to log and timeout slow queries
+      block:
+        - name: Set log_min_duration_statement to 5000ms
+          community.postgresql.postgresql_conf:
+            name: log_min_duration_statement
+            value: '5000'
+            state: present
+            owner: postgres
+            group: postgres
+            mode: '0640'
+            dest: /etc/postgresql/14/main/postgresql.conf
+            backup: true
+          notify: Reload PostgreSQL service
+        - name: Set statement_timeout to 10000ms
+          community.postgresql.postgresql_conf:
+            name: statement_timeout
+            value: '10000'
+            state: present
+            owner: postgres
+            group: postgres
+            mode: '0640'
+            dest: /etc/postgresql/14/main/postgresql.conf
+            backup: true
+          notify: Reload PostgreSQL service
+        - name: Ensure PostgreSQL service is running and enabled
+          ansible.builtin.systemd:
+            name: postgresql
+            state: started
+            enabled: true
+      rescue:
+        - name: Handle configuration update failure
+          ansible.builtin.debug:
+            msg: "Failed to update PostgreSQL configuration. Check logs for details."
+        - name: Attempt to restore PostgreSQL service state
+          ansible.builtin.systemd:
+            name: postgresql
+            state: restarted
+      always:
+        - name: Verify PostgreSQL service status
+          ansible.builtin.systemd:
+            name: postgresql
+          register: pg_service_status
+        - name: Report final service status
+          ansible.builtin.debug:
+            msg: "PostgreSQL service status: {{ pg_service_status.status.ActiveState }}"
+  handlers:
+    - name: Reload PostgreSQL service
+      ansible.builtin.systemd:
+        name: postgresql
+        state: reloaded
