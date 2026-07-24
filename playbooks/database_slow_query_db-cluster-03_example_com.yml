@@ -1,0 +1,42 @@
+
+
+---
+- name: Remediate slow database queries on PostgreSQL
+  hosts: db-cluster-03.example.com
+  become: true
+  tags:
+    - database
+    - performance
+    - production
+  tasks:
+    - name: Verify PostgreSQL service is active
+      ansible.builtin.systemd:
+        name: postgresql
+        state: started
+      register: pg_service_status
+
+    - name: Apply PostgreSQL slow query remediation configuration
+      block:
+        - name: Configure log_min_duration_statement to 5000 milliseconds
+          community.postgresql.postgresql_conf:
+            name: log_min_duration_statement
+            value: '5000'
+            section: logging
+            state: present
+
+        - name: Configure statement_timeout to 5000 milliseconds
+          community.postgresql.postgresql_conf:
+            name: statement_timeout
+            value: '5000'
+            section: defaults
+            state: present
+      rescue:
+        - name: Handle configuration update failure
+          ansible.builtin.debug:
+            msg: "PostgreSQL configuration update failed. Manual intervention required."
+
+    - name: Reload PostgreSQL service to apply configuration changes
+      ansible.builtin.systemd:
+        name: postgresql
+        state: reloaded
+      when: pg_service_status.status.ActiveState == 'active'
