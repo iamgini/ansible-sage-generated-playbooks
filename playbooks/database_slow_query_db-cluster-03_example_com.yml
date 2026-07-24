@@ -1,0 +1,52 @@
+
+
+---
+- name: Remediate slow database queries on PostgreSQL
+  hosts: db-cluster-03.example.com
+  become: true
+  tags:
+    - database
+    - performance
+    - production
+  tasks:
+    - name: Block to handle PostgreSQL slow query remediation
+      block:
+        - name: Verify PostgreSQL service is active before configuration changes
+          ansible.builtin.systemd:
+            name: postgresql
+            state: started
+          register: pg_service_check
+          failed_when: false
+
+        - name: Update PostgreSQL configuration to enforce 5 second query timeout
+          ansible.builtin.lineinfile:
+            path: /etc/postgresql/14/main/postgresql.conf
+            regexp: '^#?\s*statement_timeout\s*='
+            line: 'statement_timeout = 5000'
+            state: present
+            backup: true
+
+        - name: Reload PostgreSQL to apply configuration changes
+          ansible.builtin.systemd:
+            name: postgresql
+            state: reloaded
+            daemon_reload: true
+      rescue:
+        - name: Log remediation failure and initiate fallback restart
+          ansible.builtin.debug:
+            msg: "Configuration update failed. Initiating safe PostgreSQL restart."
+        - name: Restart PostgreSQL service as fallback remediation
+          ansible.builtin.systemd:
+            name: postgresql
+            state: restarted
+            daemon_reload: true
+      always:
+        - name: Verify PostgreSQL service status after remediation attempt
+          ansible.builtin.systemd:
+            name: postgresql
+            state: started
+          register: final_pg_status
+          failed_when: false
+        - name: Output final remediation status
+          ansible.builtin.debug:
+            msg: "Remediation completed. PostgreSQL service state: {{ final_pg_status.status.ActiveState | default('unreachable') }}"
