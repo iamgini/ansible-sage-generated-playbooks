@@ -1,0 +1,50 @@
+
+
+---
+- name: Remediate slow database queries on PostgreSQL
+  hosts: db-cluster-03.example.com
+  become: true
+  tags:
+    - database
+    - performance
+    - production
+  tasks:
+    - name: Apply PostgreSQL configuration to manage slow queries
+      block:
+        - name: Configure log_min_duration_statement to 5000 milliseconds
+          community.postgresql.postgresql_conf:
+            name: log_min_duration_statement
+            value: "5000"
+            state: present
+            owner: postgres
+            group: postgres
+            mode: "0640"
+            backup: true
+
+        - name: Configure statement_timeout to 10000 milliseconds
+          community.postgresql.postgresql_conf:
+            name: statement_timeout
+            value: "10000"
+            state: present
+            owner: postgres
+            group: postgres
+            mode: "0640"
+            backup: true
+
+        - name: Reload PostgreSQL service to apply configuration changes
+          ansible.builtin.service:
+            name: postgresql
+            state: reloaded
+            daemon_reload: true
+
+      rescue:
+        - name: Log remediation failure details
+          ansible.builtin.debug:
+            msg: "PostgreSQL configuration or service reload failed. Manual intervention may be required."
+
+        - name: Ensure PostgreSQL service is running after failed reload
+          ansible.builtin.service:
+            name: postgresql
+            state: started
+            daemon_reload: true
+          ignore_errors: true
