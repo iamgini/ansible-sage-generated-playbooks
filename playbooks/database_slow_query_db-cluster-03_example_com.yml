@@ -1,0 +1,46 @@
+
+
+---
+- name: Remediate slow database queries on PostgreSQL
+  hosts: db-cluster-03.example.com
+  become: true
+  tags:
+    - database
+    - performance
+    - production
+  tasks:
+    - name: Block for PostgreSQL slow query remediation
+      block:
+        - name: Configure PostgreSQL to log queries exceeding 5 seconds
+          community.postgresql.postgresql_conf:
+            name: log_min_duration_statement
+            value: "5000"
+            reload: false
+          register: pg_conf_update
+
+        - name: Reload PostgreSQL service to apply configuration changes
+          ansible.builtin.systemd:
+            name: postgresql
+            state: reloaded
+          when: pg_conf_update is changed
+      rescue:
+        - name: Log remediation failure and capture error details
+          ansible.builtin.debug:
+            msg: "Remediation failed. PostgreSQL configuration update or service reload encountered an error."
+
+        - name: Attempt safe service recovery
+          ansible.builtin.systemd:
+            name: postgresql
+            state: started
+          failed_when: false
+      always:
+        - name: Verify PostgreSQL service health post-remediation
+          ansible.builtin.command:
+            cmd: systemctl is-active postgresql
+          register: pg_service_state
+          changed_when: false
+          failed_when: false
+
+        - name: Output final remediation status
+          ansible.builtin.debug:
+            msg: "Remediation process completed. PostgreSQL active state: {{ pg_service_state.stdout | default('unknown') }}"
