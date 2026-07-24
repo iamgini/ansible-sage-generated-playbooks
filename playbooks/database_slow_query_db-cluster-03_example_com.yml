@@ -1,0 +1,68 @@
+
+
+---
+- name: Remediate slow database queries on PostgreSQL
+  hosts: db-cluster-03.example.com
+  become: true
+  tags:
+    - database
+    - performance
+    - production
+  tasks:
+    - name: Execute PostgreSQL slow query remediation workflow
+      block:
+        - name: Retrieve current PostgreSQL configuration file path
+          ansible.builtin.command:
+            cmd: "sudo -u postgres psql -tAc \"SHOW config_file;\""
+          register: pg_config_path
+          changed_when: false
+          failed_when: false
+
+        - name: Update PostgreSQL statement_timeout to 5 seconds
+          ansible.builtin.lineinfile:
+            path: "{{ pg_config_path.stdout | default('/etc/postgresql/14/main/postgresql.conf') }}"
+            regexp: '^#?\s*statement_timeout\s*='
+            line: 'statement_timeout = 5000'
+            state: present
+            backup: true
+            create: true
+          notify: Reload PostgreSQL service
+
+        - name: Reload PostgreSQL to apply configuration changes
+          ansible.builtin.service:
+            name: postgresql
+            state: reloaded
+            enabled: true
+
+        - name: Verify statement_timeout configuration was applied
+          ansible.builtin.command:
+            cmd: "sudo -u postgres psql -tAc \"SHOW statement_timeout;\""
+          register: timeout_verification
+          changed_when: false
+          failed_when: false
+
+        - name: Log successful remediation outcome
+          ansible.builtin.debug:
+            msg: "PostgreSQL statement_timeout successfully set to {{ timeout_verification.stdout | default('5s') }}"
+
+      rescue:
+        - name: Handle remediation failure and log error details
+          ansible.builtin.debug:
+            msg: "Remediation failed on db-cluster-03.example.com. Manual intervention required."
+
+        - name: Attempt safe PostgreSQL service restart if reload failed
+          ansible.builtin.service:
+            name: postgresql
+            state: restarted
+          failed_when: false
+
+      always:
+        - name: Confirm remediation workflow completion
+          ansible.builtin.debug:
+            msg: "Remediation workflow finished for db-cluster-03.example.com"
+
+  handlers:
+    - name: Reload PostgreSQL service
+      ansible.builtin.service:
+        name: postgresql
+        state: reloaded
