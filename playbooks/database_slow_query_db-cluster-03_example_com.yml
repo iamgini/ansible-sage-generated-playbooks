@@ -1,0 +1,36 @@
+
+
+---
+- name: Remediate slow database queries on PostgreSQL
+  hosts: db-cluster-03.example.com
+  become: true
+  tags:
+    - database
+    - performance
+    - production
+  tasks:
+    - name: Block to handle PostgreSQL slow query remediation
+      block:
+        - name: Update PostgreSQL configuration to increase statement timeout
+          community.postgresql.postgresql_conf:
+            name: statement_timeout
+            value: '10s'
+            owner: postgres
+            group: postgres
+            mode: '0640'
+            state: present
+          notify: Reload PostgreSQL service
+
+        - name: Reload PostgreSQL to apply configuration changes
+          ansible.builtin.systemd:
+            name: postgresql
+            state: reloaded
+          listen: Reload PostgreSQL service
+      rescue:
+        - name: Capture and display remediation failure details
+          ansible.builtin.debug:
+            msg: "Remediation failed on {{ inventory_hostname }}. Error: {{ ansible_failed_result.msg }}"
+
+        - name: Terminate playbook due to remediation failure
+          ansible.builtin.fail:
+            msg: "PostgreSQL slow query remediation failed. Manual intervention required."
