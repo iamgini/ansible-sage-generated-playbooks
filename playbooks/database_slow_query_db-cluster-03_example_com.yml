@@ -1,0 +1,49 @@
+
+
+---
+- name: Remediate slow database queries on PostgreSQL
+  hosts: db-cluster-03.example.com
+  become: true
+  tags:
+    - database
+    - performance
+    - production
+  tasks:
+    - name: Block for PostgreSQL slow query remediation
+      block:
+        - name: Update PostgreSQL configuration to enforce 5 second statement timeout
+          ansible.builtin.lineinfile:
+            path: /etc/postgresql/14/main/postgresql.conf
+            regexp: '^#?statement_timeout'
+            line: 'statement_timeout = 5000'
+            state: present
+            backup: true
+          register: pg_config_update
+
+        - name: Reload PostgreSQL service to apply configuration changes
+          ansible.builtin.systemd:
+            name: postgresql
+            state: reloaded
+          when: pg_config_update is changed
+
+        - name: Verify PostgreSQL service is active and accepting connections
+          ansible.builtin.command:
+            cmd: pg_isready -h localhost -p 5432
+          register: pg_connection_status
+          changed_when: false
+          failed_when: pg_connection_status.rc != 0
+      rescue:
+        - name: Log remediation failure and attempt service recovery
+          ansible.builtin.debug:
+            msg: "Remediation encountered an error. Initiating service recovery."
+
+        - name: Restart PostgreSQL service to restore stability
+          ansible.builtin.systemd:
+            name: postgresql
+            state: restarted
+          ignore_errors: true
+
+      always:
+        - name: Record final remediation status
+          ansible.builtin.debug:
+            msg: "Slow query remediation workflow has completed execution."
