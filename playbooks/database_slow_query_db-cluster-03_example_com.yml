@@ -1,0 +1,38 @@
+
+
+---
+- name: Remediate database slow query performance issue
+  hosts: db-cluster-03.example.com
+  become: true
+  tags:
+    - database
+    - performance
+    - production
+
+  tasks:
+    - name: Remediate slow query configuration
+      block:
+        - name: Set log_min_duration_statement to 5000ms
+          ansible.builtin.lineinfile:
+            path: /var/lib/pgsql/data/postgresql.conf
+            regexp: '^#?log_min_duration_statement\s*='
+            line: 'log_min_duration_statement = 5000'
+            state: present
+            backup: true
+          notify: Restart PostgreSQL service
+
+        - name: Ensure PostgreSQL service is running
+          ansible.builtin.systemd:
+            name: postgresql
+            state: started
+            enabled: true
+      rescue:
+        - name: Handle remediation failure
+          ansible.builtin.debug:
+            msg: "Remediation failed. Manual intervention required."
+
+  handlers:
+    - name: Restart PostgreSQL service
+      ansible.builtin.systemd:
+        name: postgresql
+        state: restarted
