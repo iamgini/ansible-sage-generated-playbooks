@@ -1,0 +1,64 @@
+
+
+---
+- name: Remediate slow database queries on PostgreSQL
+  hosts: db-cluster-03.example.com
+  become: true
+  tags:
+    - database
+    - performance
+    - production
+  tasks:
+    - name: Remediate slow query performance issue
+      block:
+        - name: Retrieve current PostgreSQL configuration and settings
+          community.postgresql.postgresql_info:
+            login_user: postgres
+            login_db: postgres
+          register: pg_settings
+          changed_when: false
+
+        - name: Extract current statement_timeout and config file path
+          ansible.builtin.set_fact:
+            current_timeout: "{{ pg_settings['pg_settings']['statement_timeout']['setting'] }}"
+            config_file: "{{ pg_settings['pg_settings']['config_file']['setting'] }}"
+            desired_timeout: "5000"
+            needs_update: "{{ current_timeout != desired_timeout }}"
+
+        - name: Update PostgreSQL configuration to limit query execution time
+          ansible.builtin.lineinfile:
+            path: "{{ config_file }}"
+            regexp: '^#?\s*statement_timeout\s*='
+            line: "statement_timeout = {{ desired_timeout }}"
+            state: present
+            backup: true
+          when: needs_update
+
+        - name: Reload PostgreSQL configuration to apply changes
+          community.postgresql.postgresql_query:
+            login_user: postgres
+            login_db: postgres
+            query: "SELECT pg_reload_conf();"
+          when: needs_update
+
+        - name: Verify statement_timeout setting after remediation
+          community.postgresql.postgresql_info:
+            login_user: postgres
+            login_db: postgres
+          register: pg_verification
+          changed_when: false
+
+        - name: Assert that statement_timeout matches the desired value
+          ansible.builtin.assert:
+            that:
+              - pg_verification['pg_settings']['statement_timeout']['setting'] == desired_timeout
+            fail_msg: "Remediation failed: statement_timeout is {{ pg_verification['pg_settings']['statement_timeout']['setting'] }}, expected {{ desired_timeout }}"
+            success_msg: "Remediation successful: statement_timeout is set to {{ desired_timeout }}"
+      rescue:
+        - name: Handle remediation failure and log error
+          ansible.builtin.debug:
+            msg: "Remediation failed for slow query issue on db-cluster-03.example.com. Please check PostgreSQL logs and configuration manually."
+
+        - name: Fail playbook execution after error handling
+          ansible.builtin.fail:
+            msg: "PostgreSQL slow query remediation encountered an error. See debug output for details."
