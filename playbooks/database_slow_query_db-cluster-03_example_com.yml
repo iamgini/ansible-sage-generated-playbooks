@@ -1,0 +1,69 @@
+
+
+---
+- name: Remediate slow database queries on PostgreSQL
+  hosts: db-cluster-03.example.com
+  become: true
+  tags:
+    - database
+    - performance
+    - production
+  tasks:
+    - name: Validate PostgreSQL service status and configuration
+      block:
+        - name: Gather system service facts
+          ansible.builtin.service_facts:
+
+        - name: Verify PostgreSQL service is active
+          ansible.builtin.assert:
+            that:
+              - ansible_facts.services['postgresql.service'] is defined
+              - ansible_facts.services['postgresql.service'].state == 'running'
+            fail_msg: "PostgreSQL service is not running. Aborting remediation."
+            success_msg: "PostgreSQL service is running."
+
+        - name: Determine PostgreSQL configuration path based on OS family
+          ansible.builtin.set_fact:
+            postgresql_conf_path: "{{ '/etc/postgresql/14/main/postgresql.conf' if ansible_os_family == 'Debian' else '/var/lib/pgsql/data/postgresql.conf' }}"
+
+        - name: Configure slow query logging threshold
+          ansible.builtin.lineinfile:
+            path: "{{ postgresql_conf_path }}"
+            regexp: '^#?\s*log_min_duration_statement\s*='
+            line: 'log_min_duration_statement = 5000'
+            state: present
+            backup: true
+            notify: Reload PostgreSQL service
+
+        - name: Configure statement timeout threshold
+          ansible.builtin.lineinfile:
+            path: "{{ postgresql_conf_path }}"
+            regexp: '^#?\s*statement_timeout\s*='
+            line: 'statement_timeout = 5000'
+            state: present
+            backup: true
+            notify: Reload PostgreSQL service
+      rescue:
+        - name: Log remediation failure and attempt safe service reload
+          ansible.builtin.debug:
+            msg: "Configuration update failed. Attempting safe PostgreSQL reload to apply existing changes."
+
+        - name: Attempt safe PostgreSQL reload
+          ansible.builtin.systemd:
+            name: postgresql
+            state: reloaded
+          ignore_errors: true
+
+        - name: Record remediation failure status
+          ansible.builtin.debug:
+            msg: "Remediation encountered errors. Please review PostgreSQL logs and configuration manually."
+      always:
+        - name: Log remediation completion status
+          ansible.builtin.debug:
+            msg: "Slow query remediation process finished for db-cluster-03.example.com."
+
+  handlers:
+    - name: Reload PostgreSQL service
+      ansible.builtin.systemd:
+        name: postgresql
+        state: reloaded
