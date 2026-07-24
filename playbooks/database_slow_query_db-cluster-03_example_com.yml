@@ -1,0 +1,60 @@
+
+
+---
+- name: Remediate slow database queries on PostgreSQL
+  hosts: db-cluster-03.example.com
+  become: true
+  tags:
+    - database
+    - performance
+    - production
+  tasks:
+    - name: Execute PostgreSQL slow query remediation with error handling
+      block:
+        - name: Update PostgreSQL configuration to enforce 5 second query timeout
+          ansible.builtin.lineinfile:
+            path: /etc/postgresql/14/main/postgresql.conf
+            regexp: '^statement_timeout\s*='
+            line: 'statement_timeout = 5000'
+            state: present
+            backup: true
+          notify: Reload PostgreSQL service
+
+        - name: Reload PostgreSQL to apply configuration changes
+          ansible.builtin.service:
+            name: postgresql
+            state: reloaded
+      rescue:
+        - name: Log remediation failure and apply fallback configuration
+          ansible.builtin.debug:
+            msg: "Primary configuration update failed. Applying fallback settings."
+
+        - name: Apply fallback PostgreSQL configuration update
+          ansible.builtin.lineinfile:
+            path: /etc/postgresql/14/main/postgresql.conf
+            regexp: '^statement_timeout\s*='
+            line: 'statement_timeout = 5000'
+            state: present
+            backup: true
+          notify: Reload PostgreSQL service
+
+        - name: Reload PostgreSQL after fallback execution
+          ansible.builtin.service:
+            name: postgresql
+            state: reloaded
+      always:
+        - name: Verify PostgreSQL service operational status
+          ansible.builtin.command:
+            cmd: "systemctl is-active postgresql"
+          register: pg_service_status
+          changed_when: false
+          failed_when: false
+
+        - name: Output final remediation status report
+          ansible.builtin.debug:
+            msg: "Remediation process completed. PostgreSQL service status: {{ pg_service_status.stdout | default('unavailable') }}"
+  handlers:
+    - name: Reload PostgreSQL service
+      ansible.builtin.service:
+        name: postgresql
+        state: reloaded
